@@ -1,3 +1,16 @@
+# scale the workers
+`docker compose -f dev.docker-compose.yaml up -d --scale attendee-worker-local=3`
+
+# Fetch from original repo
+`git fetch upstream`
+
+# Fetch from your fork
+`git fetch origin`
+
+# Push to your fork
+`git push origin disable-recording`
+
+
 <div align="center">
 <img src="static/images/logo_black_white.svg" width="300" alt="Attendee Logo">
 </div>
