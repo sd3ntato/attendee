@@ -7,6 +7,9 @@ class StyleManager {
         this.frameStyleElement = null;
         this.frameAdjustInterval = null;
         this.neededInteractionsInterval = null;
+
+        // Stream used which combines the audio tracks from the meeting. Does NOT include the bot's audio
+        this.meetingAudioStream = null;
     }
 
     addAudioTrack(audioTrack) {
@@ -52,7 +55,30 @@ class StyleManager {
         if (chatButton && !this.chatButtonClicked) {
             chatButton.click();
             this.chatButtonClicked = true;
+            
+            // Wait until the chat input element appears in the DOM
+            this.waitForChatInputAndSendReadyMessage();
         }
+    }
+
+    waitForChatInputAndSendReadyMessage() {
+        const checkForChatInput = () => {
+            const chatInput = document.querySelector('[aria-label="Type a message"]');
+            if (chatInput) {
+                // Chat input is now available, send the ready message
+                window.ws.sendJson({
+                    type: 'ChatStatusChange',
+                    change: 'ready_to_send'
+                });
+                console.log('Chat input element found, ready to send messages');
+            } else {
+                // Chat input not found yet, check again in 500ms
+                setTimeout(checkForChatInput, 500);
+            }
+        };
+        
+        // Start checking for the chat input element
+        checkForChatInput();
     }
 
     startSilenceDetection() {
@@ -84,6 +110,11 @@ class StyleManager {
  
          this.mixedAudioTrack = destination.stream.getAudioTracks()[0];
 
+        // Process and send mixed audio if enabled
+        if (window.initialData.sendMixedAudio && this.mixedAudioTrack) {
+            this.processMixedAudioTrack();
+        }
+
         // Clear any existing interval
         if (this.silenceCheckInterval) {
             clearInterval(this.silenceCheckInterval);
@@ -102,76 +133,190 @@ class StyleManager {
         this.neededInteractionsInterval = setInterval(() => {
             this.checkNeededInteractions();
         }, 5000);
-    }
 
-    makeMainVideoFillFrame() {
-        // Create a style element
-        const style = document.createElement('style');
-        
-        // Define the CSS rules
-        style.textContent = `
-            /* First, hide all elements */
-            body * {
-            display: none !important;
-            }
-            
-            /* Make the target element visible */
-            [data-test-segment-type="central"] {
-            display: block !important;
-            }
-            
-            /* Make all parents of the target element visible - this works because an element must be displayed for its children to be visible */
-            [data-test-segment-type="central"] ancestor {
-            display: block !important;
-            }
-            
-            /* Make all ancestors visible using :has() selector (modern browsers) */
-            *:has([data-test-segment-type="central"]) {
-            display: block !important;
-            }
-            
-            /* Make all children visible */
-            [data-test-segment-type="central"] * {
-            display: inherit !important;
-            }
-        `;
-        
-        // Add the style element to the document head
-        document.head.appendChild(style);
-        
-        // Store reference to the style element
-        this.frameStyleElement = style;
-        
-        // Initial adjustment
-        this.adjustCentralElement();
-        
-        // Set up interval to readjust the central element regularly
-        this.frameAdjustInterval = setInterval(() => {
-            this.adjustCentralElement();
-        }, 250);
+        this.meetingAudioStream = destination.stream;
     }
     
-    adjustCentralElement() {
+    getMeetingAudioStream() {
+        return this.meetingAudioStream;
+    }
+
+    async processMixedAudioTrack() {
+        try {
+            // Create processor to get raw audio frames from the mixed audio track
+            const processor = new MediaStreamTrackProcessor({ track: this.mixedAudioTrack });
+            const generator = new MediaStreamTrackGenerator({ kind: 'audio' });
+            
+            // Get readable stream of audio frames
+            const readable = processor.readable;
+            const writable = generator.writable;
+
+            // Transform stream to intercept and send audio frames
+            const transformStream = new TransformStream({
+                async transform(frame, controller) {
+                    if (!frame) {
+                        return;
+                    }
+
+                    try {
+                        // Check if controller is still active
+                        if (controller.desiredSize === null) {
+                            frame.close();
+                            return;
+                        }
+
+                        // Copy the audio data
+                        const numChannels = frame.numberOfChannels;
+                        const numSamples = frame.numberOfFrames;
+                        const audioData = new Float32Array(numSamples);
+                        
+                        // Copy data from each channel
+                        // If multi-channel, average all channels together to create mono output
+                        if (numChannels > 1) {
+                            // Temporary buffer to hold each channel's data
+                            const channelData = new Float32Array(numSamples);
+                            
+                            // Sum all channels
+                            for (let channel = 0; channel < numChannels; channel++) {
+                                frame.copyTo(channelData, { planeIndex: channel });
+                                for (let i = 0; i < numSamples; i++) {
+                                    audioData[i] += channelData[i];
+                                }
+                            }
+                            
+                            // Average by dividing by number of channels
+                            for (let i = 0; i < numSamples; i++) {
+                                audioData[i] /= numChannels;
+                            }
+                        } else {
+                            // If already mono, just copy the data
+                            frame.copyTo(audioData, { planeIndex: 0 });
+                        }
+
+                        // Send mixed audio data via websocket
+                        const timestamp = performance.now();
+                        window.ws.sendMixedAudio(timestamp, audioData);
+                        
+                        // Pass through the original frame
+                        controller.enqueue(frame);
+                    } catch (error) {
+                        console.error('Error processing mixed audio frame:', error);
+                        frame.close();
+                    }
+                },
+                flush() {
+                    console.log('Mixed audio transform stream flush called');
+                }
+            });
+
+            // Create an abort controller for cleanup
+            const abortController = new AbortController();
+
+            try {
+                // Connect the streams
+                await readable
+                    .pipeThrough(transformStream)
+                    .pipeTo(writable, {
+                        signal: abortController.signal
+                    })
+                    .catch(error => {
+                        if (error.name !== 'AbortError') {
+                            console.error('Mixed audio pipeline error:', error);
+                        }
+                    });
+            } catch (error) {
+                console.error('Mixed audio stream pipeline error:', error);
+                abortController.abort();
+            }
+
+        } catch (error) {
+            console.error('Error setting up mixed audio processor:', error);
+        }
+    }
+ 
+    makeMainVideoFillFrame = function() {
+        /* ── 0.  Cleanup from earlier runs ─────────────────────────────── */
+        if (this.blanket?.isConnected) this.blanket.remove();
+        if (this.frameStyleElement?.isConnected) this.frameStyleElement.remove();
+        if (this.frameAdjustInterval) {
+            cancelAnimationFrame(this.frameAdjustInterval);   // ← was clearInterval
+            this.frameAdjustInterval = null;
+        }
+    
+        /* ── 1.  Inject the blanket ────────────────────────────────────── */
+        const blanket = document.createElement("div");
+        blanket.id = "attendee-blanket";
+        Object.assign(blanket.style, {
+            position: "fixed",
+            inset: "0",
+            background: "#fff",
+            zIndex: 1998,              // below the video we’ll promote
+            pointerEvents: "none"      // lets events fall through
+        });
+        document.body.appendChild(blanket);
+        this.blanket = blanket;
+    
+        /* ── 2.  Promote the central video and its descendants ─────────── */
+        const style = document.createElement("style");
+        style.textContent = `
+            /* central pane fills the viewport, highest z‑index */
+            [data-test-segment-type="central"] {
+                position: fixed !important;
+                inset: 0 !important;
+                width: 100vw !important;
+                height: 100vh !important;
+                z-index: 1999 !important;   /* > blanket */
+            }
+            /* make sure its children inherit size & events normally */
+            [data-test-segment-type="central"], 
+            [data-test-segment-type="central"] * {
+                pointer-events: auto !important;
+            }
+        `;
+        document.head.appendChild(style);
+        this.frameStyleElement = style;
+    
+        /* ── 3.  Keep the central element the right size ───────────────── */
+        const adjust = () => {
+            this.adjustCentralElement?.();
+            this.frameAdjustInterval = requestAnimationFrame(adjust);  // ← RAF loop
+        };
+        adjust();  // kick it off
+    }
+    
+    adjustCentralElement = function() {
         // Get the central element
         const centralElement = document.querySelector('[data-test-segment-type="central"]');
         
-        // Function to remove width and height from inline styles
+        // Function to resize the central element
         function adjustCentralElementSize(element) {
-            if (element.style) {
-                element.style.width = `${window.initialData.videoFrameWidth}px`;
+            if (element?.style) {
+                element.style.width  = `${window.initialData.videoFrameWidth}px`;
                 element.style.height = `${window.initialData.videoFrameHeight}px`;
+                element.style.position = 'fixed';
+            }
+        }
+    
+        function adjustChildElement(element) {
+            if (element?.style) {
+                element.style.position = 'fixed';
+                element.style.width  = '100%';
+                element.style.height = '100%';
+                element.style.top  = '0';
+                element.style.left = '0';
             }
         }
         
         if (centralElement) {
-            // Remove styles from the central element
-            adjustCentralElementSize(centralElement.children[0].children[0].children[0]);
-            adjustCentralElementSize(centralElement.children[0]);
+            adjustChildElement(centralElement?.children[0]?.children[0]?.children[0]?.children[0]?.children[0]);
+            adjustChildElement(centralElement?.children[0]?.children[0]?.children[0]?.children[0]);
+            adjustChildElement(centralElement?.children[0]?.children[0]?.children[0]);
+            adjustChildElement(centralElement?.children[0]);
             adjustCentralElementSize(centralElement);
         }
     }
-
-    restoreOriginalFrame() {
+    
+    restoreOriginalFrame = function() {
         // If we have a reference to the style element, remove it
         if (this.frameStyleElement) {
             this.frameStyleElement.remove();
@@ -179,9 +324,9 @@ class StyleManager {
             console.log('Removed video frame style element');
         }
         
-        // Clear the adjustment interval if it exists
+        // Cancel the RAF loop if it exists
         if (this.frameAdjustInterval) {
-            clearInterval(this.frameAdjustInterval);
+            cancelAnimationFrame(this.frameAdjustInterval);   // ← was clearInterval
             this.frameAdjustInterval = null;
         }
     }
@@ -219,6 +364,24 @@ class StyleManager {
 class DominantSpeakerManager {
     constructor() {
         this.dominantSpeakerStreamId = null;
+        this.captionAudioTimes = [];
+    }
+
+    getLastSpeakerIdForTimestampMs(timestampMs) {
+        // Find the caption audio times that are before timestampMs
+        const captionAudioTimesBeforeTimestampMs = this.captionAudioTimes.filter(captionAudioTime => captionAudioTime.timestampMs <= timestampMs);
+        if (captionAudioTimesBeforeTimestampMs.length === 0) {
+            return null;
+        }
+        // Return the caption audio time with the highest timestampMs
+        return captionAudioTimesBeforeTimestampMs.reduce((max, captionAudioTime) => captionAudioTime.timestampMs > max.timestampMs ? captionAudioTime : max).speakerId;
+    }
+
+    addCaptionAudioTime(timestampMs, speakerId) {
+        this.captionAudioTimes.push({
+            timestampMs: timestampMs,
+            speakerId: speakerId
+        });
     }
 
     setDominantSpeakerStreamId(dominantSpeakerStreamId) {
@@ -729,6 +892,7 @@ class UserManager {
     }
 
     convertUser(user) {
+        const currentUserId = window.callManager?.getCurrentUserId();
         return {
             deviceId: user.details.id,
             displayName: user.details.displayName,
@@ -736,6 +900,8 @@ class UserManager {
             profile: '',
             status: user.state,
             humanized_status: user.state === "active" ? "in_meeting" : "not_in_meeting",
+            isCurrentUser: (!!currentUserId) && (user.details.id === currentUserId),
+            isHost: user.meetingRole === "organizer"
         }
     }
 
@@ -772,7 +938,9 @@ class UserManager {
                 profile: user.profile,
                 status: user.status,
                 humanized_status: user.humanized_status,
-                parentDeviceId: user.parentDeviceId
+                parentDeviceId: user.parentDeviceId,
+                isCurrentUser: user.isCurrentUser,
+                isHost: user.isHost
             });
         }
 
@@ -796,7 +964,9 @@ class UserManager {
                 profilePicture: user.profilePicture,
                 status: user.status,
                 humanized_status: user.humanized_status,
-                parentDeviceId: user.parentDeviceId
+                parentDeviceId: user.parentDeviceId,
+                isCurrentUser: user.isCurrentUser,
+                isHost: user.isHost
             });
         }
 
@@ -819,7 +989,9 @@ class WebSocketClient {
     static MESSAGE_TYPES = {
         JSON: 1,
         VIDEO: 2,  // Reserved for future use
-        AUDIO: 3   // Reserved for future use
+        AUDIO: 3,   // Reserved for future use
+        ENCODED_MP4_CHUNK: 4,
+        PER_PARTICIPANT_AUDIO: 5
     };
   
     constructor() {
@@ -963,7 +1135,73 @@ class WebSocketClient {
             caption: item
         });
     }
+
+    sendMixedAudio(timestamp, audioData) {
+        if (this.ws.readyState !== originalWebSocket.OPEN) {
+            realConsole?.error('WebSocket is not connected for audio send', this.ws.readyState);
+            return;
+        }
   
+        if (!this.mediaSendingEnabled) {
+          return;
+        }
+  
+        try {
+            // Create final message: type (4 bytes) + audio data
+            const message = new Uint8Array(4 + audioData.buffer.byteLength);
+            const dataView = new DataView(message.buffer);
+            
+            // Set message type (3 for AUDIO)
+            dataView.setInt32(0, WebSocketClient.MESSAGE_TYPES.AUDIO, true);
+            
+            // Copy audio data after type
+            message.set(new Uint8Array(audioData.buffer), 4);
+            
+            // Send the binary message
+            this.ws.send(message.buffer);
+        } catch (error) {
+            realConsole?.error('Error sending WebSocket audio message:', error);
+        }
+    }
+  
+    sendPerParticipantAudio(participantId, audioData) {
+        if (this.ws.readyState !== originalWebSocket.OPEN) {
+            realConsole?.error('WebSocket is not connected for per participant audio send', this.ws.readyState);
+            return;
+        }
+    
+        if (!this.mediaSendingEnabled) {
+          return;
+        }
+    
+        try {
+            // Convert participantId to UTF-8 bytes
+            const participantIdBytes = new TextEncoder().encode(participantId);
+            
+            // Create final message: type (4 bytes) + participantId length (1 byte) + 
+            // participantId bytes + audio data
+            const message = new Uint8Array(4 + 1 + participantIdBytes.length + audioData.buffer.byteLength);
+            const dataView = new DataView(message.buffer);
+            
+            // Set message type (5 for PER_PARTICIPANT_AUDIO)
+            dataView.setInt32(0, WebSocketClient.MESSAGE_TYPES.PER_PARTICIPANT_AUDIO, true);
+            
+            // Set participantId length as uint8 (1 byte)
+            dataView.setUint8(4, participantIdBytes.length);
+            
+            // Copy participantId bytes
+            message.set(participantIdBytes, 5);
+            
+            // Copy audio data after type, length and participantId
+            message.set(new Uint8Array(audioData.buffer), 5 + participantIdBytes.length);
+            
+            // Send the binary message
+            this.ws.send(message.buffer);
+        } catch (error) {
+            realConsole?.error('Error sending WebSocket audio message:', error);
+        }
+      }
+
     sendAudio(timestamp, streamId, audioData) {
         if (this.ws.readyState !== originalWebSocket.OPEN) {
             realConsole?.error('WebSocket is not connected for audio send', this.ws.readyState);
@@ -1259,6 +1497,7 @@ const dominantSpeakerManager = new DominantSpeakerManager();
 
 const styleManager = new StyleManager();
 window.styleManager = styleManager;
+
 if (!realConsole) {
     if (document.readyState === 'complete') {
         createIframe();
@@ -1280,46 +1519,107 @@ const processDominantSpeakerHistoryMessage = (item) => {
     realConsole?.log('newDominantSpeakerParticipant', dominantSpeakerManager.getDominantSpeaker());
 }
 
+function convertTimestampAudioSentToUnixTimeMs(timestampAudioSent) {
+    const fractional_seconds_since_1900 = timestampAudioSent / 10000000;
+    const fractional_seconds_since_1970 = fractional_seconds_since_1900 - 2_208_988_800;
+    return Math.floor(fractional_seconds_since_1970 * 1000);
+}
+
+class UtteranceIdGenerator {
+    constructor(generate = () => crypto.randomUUID()) {
+      this._activeIds = new Map();  // Map<speakerKey, utteranceId>
+      this._generate = generate;    // Injectable for tests
+    }
+  
+    /**
+     * @param {string} speakerKey  – any stable identifier for the speaker
+     * @param {boolean} isFinal    – true only on the last chunk of an utterance
+     * @returns {string}           – the utteranceId to attach to this chunk
+     */
+    next(speakerKey = 'default', isFinal = false) {
+      // Reuse or create
+      let id = this._activeIds.get(speakerKey);
+      if (!id) {
+        id = this._generate();
+        // Only keep it around if more chunks are expected
+        if (!isFinal) this._activeIds.set(speakerKey, id);
+      } else if (isFinal) {
+        // Utterance ends: remove from the map after returning the same ID
+        this._activeIds.delete(speakerKey);
+      }
+  
+      return id;
+    }
+  
+    /** Optional: free all state (e.g., when a call ends) */
+    dispose() {
+      this._activeIds.clear();
+    }
+}
+
+const utteranceIdGenerator = new UtteranceIdGenerator();
+
 const processClosedCaptionData = (item) => {
     realConsole?.log('processClosedCaptionData', item);
+
+    // If we're collecting per participant audio, we actually need the caption data because it's the most accurate
+    // way to estimate when someone started speaking.
+    if (window.initialData.sendPerParticipantAudio)
+    {
+        const timeStampAudioSentUnixMs = convertTimestampAudioSentToUnixTimeMs(item.timestampAudioSent);
+        dominantSpeakerManager.addCaptionAudioTime(timeStampAudioSentUnixMs, item.userId);
+    }
+
+    // If we don't need the captions, we can leave.
+    if (!window.initialData.collectCaptions)
+    {
+        return;
+    }
+
     if (!window.ws) {
         return;
     }
 
-    const captionId = item.id.split("/")[0] + ":" + item.timestampAudioSent.toString();
-
     const itemConverted = {
         deviceId: item.userId,
-        captionId: captionId,
+        captionId: utteranceIdGenerator.next(item.userId, item.isFinal),
         text: item.text,
         audioTimestamp: item.timestampAudioSent,
         isFinal: item.isFinal
     };
-
+    
     window.ws.sendClosedCaptionUpdate(itemConverted);
 }
 
-const handleMainChannelEvent = (event) => {
-    //realConsole?.log('handleMainChannelEvent', event);
-    const decodedData = new Uint8Array(event.data);
-
-    const jsonRawString = new TextDecoder().decode(decodedData);
-    //realConsole?.log('handleMainChannelEvent jsonRawString', jsonRawString);
-    
-    // Find the start of the JSON data (looking for '[' or '{' character)
-    let jsonStart = 0;
+const decodeMainChannelData = (data) => {
+    const decodedData = new Uint8Array(data);
     for (let i = 0; i < decodedData.length; i++) {
         if (decodedData[i] === 91 || decodedData[i] === 123) { // ASCII code for '[' or '{'
-            jsonStart = i;
-            break;
+            const candidateJsonString = new TextDecoder().decode(decodedData.slice(i));
+            try {
+                return JSON.parse(candidateJsonString);
+            }
+            catch(e) {
+                if (e instanceof SyntaxError) {
+                    // If JSON parsing fails, continue looking for the next '[' or '{' character
+                    // as binary data may contain bytes that coincidentally match these character codes
+                    continue;
+                }
+                realConsole?.error('Failed to parse main channel data:', e);
+                return;            
+            }        
         }
     }
-    
-    // Extract and parse the JSON portion
-    const jsonString = new TextDecoder().decode(decodedData.slice(jsonStart));
+}
+
+const handleMainChannelEvent = (event) => {
     try {
-        const parsedData = JSON.parse(jsonString);
-        //realConsole?.log('handleMainChannelEvent parsedData', parsedData);
+        const parsedData = decodeMainChannelData(event.data);
+        if (!parsedData) {
+            realConsole?.error('handleMainChannelEvent: Failed to parse main channel data, returning, data:', event.data);
+            return;
+        }
+        realConsole?.log('handleMainChannelEvent parsedData', parsedData);
         // When you see this parsedData [{"history":[1053,2331],"type":"dsh"}]
         // it corresponds to active speaker
         if (Array.isArray(parsedData)) {
@@ -1339,7 +1639,7 @@ const handleMainChannelEvent = (event) => {
             }
         }
     } catch (e) {
-        realConsole?.error('Failed to parse main channel data:', e);
+        realConsole?.error('handleMainChannelEvent: Failed to parse main channel data:', e);
     }
 }
 
@@ -1355,23 +1655,13 @@ const processSourceRequest = (item) => {
 }
 
 const handleMainChannelSend = (data) => {
-    const decodedData = new Uint8Array(data);
 
-    const jsonRawString = new TextDecoder().decode(decodedData);
-    
-    // Find the start of the JSON data (looking for '[' or '{' character)
-    let jsonStart = 0;
-    for (let i = 0; i < decodedData.length; i++) {
-        if (decodedData[i] === 91 || decodedData[i] === 123) { // ASCII code for '[' or '{'
-            jsonStart = i;
-            break;
-        }
-    }
-    
-    // Extract and parse the JSON portion
-    const jsonString = new TextDecoder().decode(decodedData.slice(jsonStart));
     try {
-        const parsedData = JSON.parse(jsonString);
+        const parsedData = decodeMainChannelData(data);
+        if (!parsedData) {
+            realConsole?.error('handleMainChannelSend: Failed to parse main channel data, returning, data:', data);
+            return;
+        }
         realConsole?.log('handleMainChannelSend parsedData', parsedData);  
         // if it is an array
         if (Array.isArray(parsedData)) {
@@ -1384,7 +1674,7 @@ const handleMainChannelSend = (data) => {
             }
         }
     } catch (e) {
-        realConsole?.error('Failed to parse main channel data:', e);
+        realConsole?.error('handleMainChannelSend: Failed to parse main channel data:', e);
     }
 }
 
@@ -1543,8 +1833,36 @@ const handleVideoTrack = async (event) => {
     }
   };
 
-const handleAudioTrack = async (event) => {
+
+  const handleAudioTrack = async (event) => {
     let lastAudioFormat = null;  // Track last seen format
+    const audioDataQueue = [];
+    const ACTIVE_SPEAKER_LATENCY_MS = 2000;
+    
+    // Start continuous background processing of the audio queue
+    const processAudioQueue = () => {
+        while (audioDataQueue.length > 0 && 
+            Date.now() - audioDataQueue[0].audioArrivalTime >= ACTIVE_SPEAKER_LATENCY_MS) {
+            const { audioData, audioArrivalTime } = audioDataQueue.shift();
+
+            // Get the dominant speaker and assume that's who the participant speaking is
+            const dominantSpeakerId = dominantSpeakerManager.getLastSpeakerIdForTimestampMs(audioArrivalTime);
+
+            // Send audio data through websocket
+            if (dominantSpeakerId) {
+                ws.sendPerParticipantAudio(dominantSpeakerId, audioData);
+            }
+        }
+    };
+
+    // Set up background processing every 100ms
+    const queueProcessingInterval = setInterval(processAudioQueue, 100);
+    
+    // Clean up interval when track ends
+    event.track.addEventListener('ended', () => {
+        clearInterval(queueProcessingInterval);
+        console.log('Audio track ended, cleared queue processing interval');
+    });
     
     try {
       // Create processor to get raw frames
@@ -1572,12 +1890,29 @@ const handleAudioTrack = async (event) => {
                   // Copy the audio data
                   const numChannels = frame.numberOfChannels;
                   const numSamples = frame.numberOfFrames;
-                  const audioData = new Float32Array(numChannels * numSamples);
+                  const audioData = new Float32Array(numSamples);
                   
                   // Copy data from each channel
-                  for (let channel = 0; channel < numChannels; channel++) {
-                      frame.copyTo(audioData.subarray(channel * numSamples, (channel + 1) * numSamples), 
-                                { planeIndex: channel });
+                  // If multi-channel, average all channels together
+                  if (numChannels > 1) {
+                      // Temporary buffer to hold each channel's data
+                      const channelData = new Float32Array(numSamples);
+                      
+                      // Sum all channels
+                      for (let channel = 0; channel < numChannels; channel++) {
+                          frame.copyTo(channelData, { planeIndex: channel });
+                          for (let i = 0; i < numSamples; i++) {
+                              audioData[i] += channelData[i];
+                          }
+                      }
+                      
+                      // Average by dividing by number of channels
+                      for (let i = 0; i < numSamples; i++) {
+                          audioData[i] /= numChannels;
+                      }
+                  } else {
+                      // If already mono, just copy the data
+                      frame.copyTo(audioData, { planeIndex: 0 });
                   }
   
                   // console.log('frame', frame)
@@ -1585,35 +1920,36 @@ const handleAudioTrack = async (event) => {
   
                   // Check if audio format has changed
                   const currentFormat = {
-                      numberOfChannels: frame.numberOfChannels,
+                      numberOfChannels: 1,
+                      originalNumberOfChannels: frame.numberOfChannels,
                       numberOfFrames: frame.numberOfFrames,
                       sampleRate: frame.sampleRate,
                       format: frame.format,
                       duration: frame.duration
                   };
-                  //realConsole?.log('currentFormat', currentFormat);
   
                   // If format is different from last seen format, send update
                   if (!lastAudioFormat || 
                       JSON.stringify(currentFormat) !== JSON.stringify(lastAudioFormat)) {
                       lastAudioFormat = currentFormat;
-                      realConsole?.log('sending audio format update');
                       ws.sendJson({
                           type: 'AudioFormatUpdate',
                           format: currentFormat
                       });
                   }
   
-                  // If the audioData buffer is all zeros, then we don't want to send it
-                  if (audioData.every(value => value === 0)) {
-                    //realConsole?.log('audioData is all zeros');
-                      return;
-                  }
-  
-                  // Send audio data through websocket
-                  const currentTimeMicros = BigInt(Math.floor(performance.now() * 1000));
-                  ws.sendAudio(currentTimeMicros, 0, audioData);
-  
+                  // If the audioData buffer is all zeros, we still want to send it. It's only one mixed audio stream.
+                  // It seems to help with the transcription.
+                  //if (audioData.every(value => value === 0)) {
+                  //    return;
+                  //}
+
+                  // Add to queue with timestamp - the background thread will process it
+                  audioDataQueue.push({
+                    audioArrivalTime: Date.now(),
+                    audioData: audioData
+                  });
+
                   // Pass through the original frame
                   controller.enqueue(frame);
               } catch (error) {
@@ -1623,6 +1959,8 @@ const handleAudioTrack = async (event) => {
           },
           flush() {
               console.log('Transform stream flush called');
+              // Clear the interval when the stream ends
+              clearInterval(queueProcessingInterval);
           }
       });
   
@@ -1640,16 +1978,23 @@ const handleAudioTrack = async (event) => {
                   if (error.name !== 'AbortError') {
                       console.error('Pipeline error:', error);
                   }
+                  // Clear the interval on error
+                  clearInterval(queueProcessingInterval);
               });
       } catch (error) {
           console.error('Stream pipeline error:', error);
           abortController.abort();
+          // Clear the interval on error
+          clearInterval(queueProcessingInterval);
       }
   
     } catch (error) {
         console.error('Error setting up audio interceptor:', error);
+        // Clear the interval on error
+        clearInterval(queueProcessingInterval);
     }
   };
+  
 
 // LOOK FOR https://api.flightproxy.skype.com/api/v2/cpconv
 
@@ -1679,6 +2024,9 @@ new RTCInterceptor({
             // but we don't need to do anything with the video tracks
             if (event.track.kind === 'audio') {
                 window.styleManager.addAudioTrack(event.track);
+                if (window.initialData.sendPerParticipantAudio) {
+                    handleAudioTrack(event);
+                }
             }
             if (event.track.kind === 'video') {
                 window.styleManager.addVideoTrack(event);
@@ -1929,6 +2277,100 @@ class BotOutputManager {
         this.gainNode = null;
         this.destination = null;
         this.botOutputAudioTrack = null;
+
+        // For outputting a stream
+        this.botOutputMediaStream = null;
+        this.botOutputPeerConnection = null;
+    }
+
+    playMediaStream(stream) {
+        if (this.botOutputMediaStream) {
+            this.botOutputMediaStream.disconnect();
+        }
+        this.botOutputMediaStream = stream;
+
+        turnOffMicAndCamera();
+
+        // after 1000 ms
+        setTimeout(() => {
+            turnOnMicAndCamera();
+        }, 1000);
+    }
+
+    async getBotOutputPeerConnectionOffer() {
+        try
+        {
+            // 2) Create the RTCPeerConnection
+            this.botOutputPeerConnection = new RTCPeerConnection();
+
+            // 3) Receive the server's *video* and *audio*
+            const ms = new MediaStream();
+            this.botOutputPeerConnection.ontrack = (ev) => {
+                ms.addTrack(ev.track);
+                // If we've received both video and audio, play the stream
+                if (ms.getVideoTracks().length > 0 && ms.getAudioTracks().length > 0) {
+                    botOutputManager.playMediaStream(ms);
+                }
+            };
+
+            // We still want to receive the server's video
+            this.botOutputPeerConnection.addTransceiver('video', { direction: 'recvonly' });
+
+            // ❗ Instead of recvonly audio, we now **send** our mic upstream:
+            const meetingAudioStream = window.styleManager.getMeetingAudioStream();
+            for (const track of meetingAudioStream.getAudioTracks()) {
+                this.botOutputPeerConnection.addTrack(track, meetingAudioStream);
+            }
+
+            // Create/POST offer → set remote answer
+            const offer = await this.botOutputPeerConnection.createOffer();
+            await this.botOutputPeerConnection.setLocalDescription(offer);
+            return { sdp: this.botOutputPeerConnection.localDescription.sdp, type: this.botOutputPeerConnection.localDescription.type };
+        }
+        catch (e) {
+            return { error: e.message };
+        }
+    }
+
+    async startBotOutputPeerConnection(offerResponse) {
+        await this.botOutputPeerConnection.setRemoteDescription(offerResponse);
+
+        // Start latency measurement for the bot output peer connection
+        this.startLatencyMeter(this.botOutputPeerConnection, "bot-output");
+    }
+
+    startLatencyMeter(pc, label="rx") {
+        setInterval(async () => {
+            const stats = await pc.getStats();
+            let rtt_ms = 0, jb_a_ms = 0, jb_v_ms = 0, dec_v_ms = 0;
+
+            stats.forEach(r => {
+                if (r.type === 'candidate-pair' && r.state === 'succeeded' && r.nominated) {
+                    rtt_ms = (r.currentRoundTripTime || 0) * 1000;
+                }
+                if (r.type === 'inbound-rtp' && r.kind === 'audio') {
+                    const d = (r.jitterBufferDelay || 0);
+                    const n = (r.jitterBufferEmittedCount || 1);
+                    jb_a_ms = (d / n) * 1000;
+                }
+                if (r.type === 'inbound-rtp' && r.kind === 'video') {
+                    const d = (r.jitterBufferDelay || 0);
+                    const n = (r.jitterBufferEmittedCount || 1);
+                    jb_v_ms = (d / n) * 1000;
+                    dec_v_ms = ((r.totalDecodeTime || 0) / (r.framesDecoded || 1)) * 1000;
+                }
+            });
+
+            const est_audio_owd = (rtt_ms / 2) + jb_a_ms;
+            const est_video_owd = (rtt_ms / 2) + jb_v_ms + dec_v_ms;
+
+            const logStatement = `[${label}] est one-way: audio≈${est_audio_owd|0}ms, video≈${est_video_owd|0}ms  (rtt=${rtt_ms|0}, jb_a=${jb_a_ms|0}, jb_v=${jb_v_ms|0}, dec_v=${dec_v_ms|0})`;
+            console.log(logStatement);
+            window.ws.sendJson({
+                type: 'BOT_OUTPUT_PEER_CONNECTION_STATS',
+                logStatement: logStatement
+            });
+        }, 60000);
     }
 
     displayImage(imageBytes) {
@@ -2206,6 +2648,10 @@ navigator.mediaDevices.getUserMedia = function(constraints) {
             newStream.addTrack(botOutputVideoElementCaptureStream.getVideoTracks()[0]);
         }
         */
+        if (constraints.video && botOutputManager.botOutputMediaStream) {
+            console.log("Adding botOutputMediaStream", botOutputManager.botOutputMediaStream.getVideoTracks()[0]);
+            newStream.addTrack(botOutputManager.botOutputMediaStream.getVideoTracks()[0]);
+        }
 
         if (constraints.video && botOutputManager.botOutputCanvasElementCaptureStream) {
             realConsole?.log("Adding canvas track", botOutputManager.botOutputCanvasElementCaptureStream.getVideoTracks()[0]);
@@ -2217,6 +2663,16 @@ navigator.mediaDevices.getUserMedia = function(constraints) {
             newStream.addTrack(botOutputManager.botOutputAudioTrack);
         }  
   
+        if (botOutputManager.botOutputMediaStream) {
+            // connect the botOutputMediaStream stream to the audio context
+            if (botOutputManager.botOutputMediaStream.getAudioTracks().length > 0) {
+                botOutputManager.initializeBotOutputAudioTrack();
+                const botOutputMediaStreamSource = botOutputManager.audioContextForBotOutput.createMediaStreamSource(botOutputManager.botOutputMediaStream);
+                botOutputMediaStreamSource.connect(botOutputManager.gainNode);
+                console.log("Connected botOutputMediaStream audio track to audio context");
+            }
+        }
+
         return newStream;
       })
       .catch(err => {
@@ -2248,6 +2704,8 @@ navigator.mediaDevices.getUserMedia = function(constraints) {
 class CallManager {
     constructor() {
         this.activeCall = null;
+        this.closedCaptionLanguageInterval = null;
+        this.closedCaptionLanguage = null;
     }
 
     setActiveCall() {
@@ -2271,6 +2729,17 @@ class CallManager {
         }
     }
 
+    getCurrentUserId() {
+        this.setActiveCall();
+        if (!this.activeCall) {
+            return;
+        }
+
+        return this.activeCall.callerMri;
+        // We're using callerMri because it includes the 8: prefix. If callerMri stops working, we can easily use the thing below.
+        // return this.activeCall.currentUserSkypeIdentity?.id;
+    }
+
     syncParticipants() {
         this.setActiveCall();
         if (!this.activeCall) {
@@ -2283,6 +2752,7 @@ class CallManager {
                 id: participant.id,
                 displayName: participant.displayName,
                 endpoints: participant.endpoints,
+                meetingRole: participant.meetingRole
             };
         }).filter(participant => participant.displayName);
 
@@ -2306,8 +2776,10 @@ class CallManager {
                 ]
             }).filter(endpoint => endpoint);
 
+            // Transform this funny format of a participant into Teams "standard" format
             const participantConverted = {
                 details: {id: participant.id, displayName: participant.displayName},
+                meetingRole: participant.meetingRole,
                 state: "active",
                 endpoints: Object.fromEntries(endpoints)
             };
@@ -2320,6 +2792,55 @@ class CallManager {
         this.setActiveCall();
         if (this.activeCall) {
             this.activeCall.startClosedCaption();
+            return true;
+        }
+        return false;
+    }
+
+    setClosedCaptionsLanguage(language) {
+        this.setActiveCall();
+        if (this.activeCall) {
+            this.closedCaptionLanguage = language;
+            this.activeCall.setClosedCaptionsLanguage(this.closedCaptionLanguage);
+            // Unfortunately, this is needed for improved reliability.
+            // It seems like when the host joins at the same time as the bot, they reset the cc language to the default.
+            setTimeout(() => {
+                if (this.activeCall) {
+                    this.activeCall.setClosedCaptionsLanguage(this.closedCaptionLanguage);
+                }
+            }, 1000);         
+            setTimeout(() => {
+                if (this.activeCall) {
+                    this.activeCall.setClosedCaptionsLanguage(this.closedCaptionLanguage);
+                }
+            }, 3000);
+            setTimeout(() => {
+                if (this.activeCall) {
+                    this.activeCall.setClosedCaptionsLanguage(this.closedCaptionLanguage);
+                }
+            }, 5000);
+            setTimeout(() => {
+                if (this.activeCall) {
+                    this.activeCall.setClosedCaptionsLanguage(this.closedCaptionLanguage);
+                    // Set an interval that runs every 60 seconds and makes sure the current closed caption language is equal to the language
+                    // This is for debugging purposes
+
+                    // Only do it if the interval is not already set
+                    if (this.closedCaptionLanguageInterval)
+                        return;
+                    this.closedCaptionLanguageInterval = setInterval(() => {
+                        if (this.activeCall && this.activeCall.getClosedCaptionsLanguage) {
+                            if (this.activeCall.getClosedCaptionsLanguage() !== this.closedCaptionLanguage) {
+                                window.ws?.sendJson({
+                                    type: "closedCaptionsLanguageMismatch",
+                                    desiredLanguage: this.closedCaptionLanguage,
+                                    currentLanguage: this.activeCall.getClosedCaptionsLanguage()
+                                });
+                            }
+                        }
+                    }, 60000);
+                }
+            }, 10000);
             return true;
         }
         return false;
