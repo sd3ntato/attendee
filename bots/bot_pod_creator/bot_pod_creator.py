@@ -160,20 +160,22 @@ class BotPodCreator:
                     )
 
     def get_pod_tolerations(self):
+        # Keep only node failure tolerations for Fargate
+        # Fargate doesn't use custom taints - removed BOT_NODE_TAINT_* logic
         return [
-                    client.V1Toleration(
-                        key="node.kubernetes.io/not-ready",
-                        operator="Exists",
-                        effect="NoExecute",
-                        toleration_seconds=900  # Tolerate not-ready nodes for 15 minutes
-                    ),
-                    client.V1Toleration(
-                        key="node.kubernetes.io/unreachable",
-                        operator="Exists",
-                        effect="NoExecute",
-                        toleration_seconds=900  # Tolerate unreachable nodes for 15 minutes
-                    )
-                ]
+            client.V1Toleration(
+                key="node.kubernetes.io/not-ready",
+                operator="Exists",
+                effect="NoExecute",
+                toleration_seconds=900  # Tolerate not-ready nodes for 15 minutes
+            ),
+            client.V1Toleration(
+                key="node.kubernetes.io/unreachable",
+                operator="Exists",
+                effect="NoExecute",
+                toleration_seconds=900  # Tolerate unreachable nodes for 15 minutes
+            )
+        ]
 
     def get_pod_image_pull_secrets(self):
         if os.getenv("DISABLE_BOT_POD_IMAGE_PULL_SECRET", "false").lower() == "true":
@@ -217,15 +219,14 @@ class BotPodCreator:
             bot_pod_labels["network-role"] = "attendee-webpage-streamer-receiver"
 
         annotations = {}
-        
+
         # Currently, experimenting with this flag to see if it helps with bot pod evictions
         # It makes the pod take longer to be provisioned, so not enabling by default.
         if os.getenv("USE_GKE_EXTENDED_DURATION_FOR_BOT_PODS", "false").lower() == "true":
             annotations["cluster-autoscaler.kubernetes.io/safe-to-evict"] = "false"
 
-        if os.getenv("USING_KARPENTER", "false").lower() == "true":
-            annotations["karpenter.sh/do-not-disrupt"] = "true"
-            annotations["karpenter.sh/do-not-evict"] = "true"
+        # Removed Karpenter annotations - using Fargate now
+        # Fargate doesn't use karpenter.sh/do-not-disrupt or karpenter.sh/do-not-evict
 
         bot_pod = client.V1Pod(
             metadata=client.V1ObjectMeta(

@@ -1,0 +1,56 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: attendee-config
+  namespace: attendee
+data:
+  # Django settings
+  DJANGO_SETTINGS_MODULE: "attendee.settings.production"
+
+  # Database configuration (uses DATABASE_URL from secrets)
+  POSTGRES_SSL_REQUIRE: "false"
+
+  # Redis configuration
+  REDIS_URL: "redis://172.31.16.245:6379/5"
+  DISABLE_REDIS_SSL: ""
+
+  # S3 Storage - use IRSA instead of hardcoded credentials
+  USE_IRSA_FOR_S3_STORAGE: "true"
+  AWS_RECORDING_STORAGE_BUCKET_NAME: "meeting-assistant-projects"
+  AWS_DEFAULT_REGION: "eu-north-1"
+
+  # Bot pod creation settings (enables Kubernetes mode)
+  LAUNCH_BOT_METHOD: "kubernetes"
+  BOT_POD_NAMESPACE: "attendee"
+  WEBPAGE_STREAMER_POD_NAMESPACE: "attendee"
+
+  # Bot pod image configuration
+  BOT_POD_IMAGE: "248127682412.dkr.ecr.eu-north-1.amazonaws.com/attendee"
+  CUBER_APP_NAME: "attendee"
+  CUBER_RELEASE_VERSION: "v1.0.1"
+
+  # Bot pod resource configuration (Fargate-compatible)
+  BOT_CPU_REQUEST: "2000m"  # 2 vCPU for Fargate (was 1800m)
+  BOT_MEMORY_REQUEST: "4Gi"
+  BOT_MEMORY_LIMIT: "4Gi"
+  BOT_EPHEMERAL_STORAGE_REQUEST: "8Gi"
+
+  # Bot pod security and service account
+  BOT_POD_SERVICE_ACCOUNT_NAME: "attendee-sa"
+  BOT_POD_CONFIG_MAP_NAME: "attendee-config"
+  BOT_POD_SECRETS_NAME: "attendee-secrets"
+  DISABLE_BOT_POD_IMAGE_PULL_SECRET: "true"
+  ENABLE_CHROME_SANDBOX: "false"
+
+  # Fargate environment (removed Karpenter taint configuration)
+  USING_FARGATE: "true"
+
+  # Webpage streamer configuration (if used)
+  WEBPAGE_STREAMER_POD_SERVICE_ACCOUNT_NAME: "attendee-sa"
+  WEBPAGE_STREAMING_CPU_REQUEST: "1"
+  WEBPAGE_STREAMING_MEMORY_REQUEST: "4Gi"
+  WEBPAGE_STREAMING_MEMORY_LIMIT: "4Gi"
+  WEBPAGE_STREAMING_EPHEMERAL_STORAGE_REQUEST: "0.5Gi"
+  WEBPAGE_STREAMING_EPHEMERAL_STORAGE_LIMIT: "0.5Gi"
+  WEBPAGE_STREAMER_TMP_SIZE_LIMIT: "1024Mi"
+  WEBPAGE_STREAMER_SHM_SIZE_LIMIT: "1024Mi"

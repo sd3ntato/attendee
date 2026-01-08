@@ -1,0 +1,6 @@
+# Never commit actual secrets
+secrets.yaml
+**/secrets.yaml
+
+# Only the template should be committed
+!secrets.yaml.template

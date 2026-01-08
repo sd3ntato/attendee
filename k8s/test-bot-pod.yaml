@@ -1,0 +1,67 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-bot-999
+  namespace: attendee
+  labels:
+    app.kubernetes.io/name: attendee
+    app.kubernetes.io/instance: attendee-v1.0.0
+    app.kubernetes.io/version: v1.0.0
+    app.kubernetes.io/managed-by: manual-test
+    app: bot-proc
+spec:
+  serviceAccountName: attendee-sa
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 60
+
+  containers:
+  - name: bot-proc
+    image: 248127682412.dkr.ecr.eu-north-1.amazonaws.com/attendee:v1.0.0
+    imagePullPolicy: Always
+
+    args:
+    - python
+    - manage.py
+    - run_bot
+    - --botid
+    - "999"
+
+    resources:
+      requests:
+        cpu: "1800m"
+        memory: 4Gi
+        ephemeral-storage: 8Gi
+      limits:
+        memory: 4Gi
+        ephemeral-storage: 8Gi
+
+    envFrom:
+    - configMapRef:
+        name: attendee-config
+    - secretRef:
+        name: attendee-secrets
+
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 1000
+      runAsGroup: 1000
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop:
+        - ALL
+      seccompProfile:
+        type: Unconfined  # Required for Chrome
+
+  tolerations:
+  - key: workload
+    operator: Equal
+    value: bot-pods
+    effect: NoSchedule
+  - key: node.kubernetes.io/not-ready
+    operator: Exists
+    effect: NoExecute
+    tolerationSeconds: 900
+  - key: node.kubernetes.io/unreachable
+    operator: Exists
+    effect: NoExecute
+    tolerationSeconds: 900
