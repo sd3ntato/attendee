@@ -3,6 +3,8 @@ services:
     build: ./
     volumes:
       - .:/attendee
+      - /home/ec2-user/.kube:/home/app/.kube:ro
+      - ./docker-entrypoint-k8s.sh:/docker-entrypoint-k8s.sh:ro
     networks:
       - attendee_network
     environment:
@@ -10,7 +12,20 @@ services:
       - REDIS_URL=redis://redis:6379/5
       - DJANGO_SETTINGS_MODULE=attendee.settings.development
       - ENABLE_CHROME_SANDBOX=true
+      - LAUNCH_BOT_METHOD=kubernetes
+      - CUBER_APP_NAME=attendee
+      - CUBER_RELEASE_VERSION=v1.0.2
+      - BOT_POD_IMAGE=248127682412.dkr.ecr.eu-north-1.amazonaws.com/meeting-assistant/attendee
+      - BOT_POD_NAMESPACE=attendee-bots
+      - BOT_POD_SERVICE_ACCOUNT_NAME=attendee-sa
+      - BOT_POD_CONFIG_MAP_NAME=attendee-config
+      - BOT_POD_SECRETS_NAME=attendee-secrets
+      - DISABLE_BOT_POD_IMAGE_PULL_SECRET=true
+      - BOT_CPU_REQUEST=700m
+      - BOT_MEMORY_REQUEST=1500Mi
+      - BOT_MEMORY_LIMIT=2Gi
     command: "celery -A attendee worker -l INFO --max-tasks-per-child=2"
+    entrypoint: ["/docker-entrypoint-k8s.sh"]
     security_opt:
       - seccomp=./bots/web_bot_adapter/chrome_seccomp.json
     deploy:
@@ -46,6 +61,8 @@ services:
     build: ./
     volumes:
       - .:/attendee
+      - /home/ec2-user/.kube:/home/app/.kube:ro
+      - ./docker-entrypoint-k8s.sh:/docker-entrypoint-k8s.sh:ro
     networks:
       - attendee_network
     ports:
@@ -54,8 +71,20 @@ services:
       - POSTGRES_HOST=postgres
       - REDIS_URL=redis://redis:6379/5
       - DJANGO_SETTINGS_MODULE=attendee.settings.development
+      - LAUNCH_BOT_METHOD=kubernetes
+      - CUBER_APP_NAME=attendee
+      - CUBER_RELEASE_VERSION=v1.0.2
+      - BOT_POD_IMAGE=248127682412.dkr.ecr.eu-north-1.amazonaws.com/meeting-assistant/attendee
+      - BOT_POD_NAMESPACE=attendee-bots
+      - BOT_POD_SERVICE_ACCOUNT_NAME=attendee-sa
+      - BOT_POD_CONFIG_MAP_NAME=attendee-config
+      - BOT_POD_SECRETS_NAME=attendee-secrets
+      - DISABLE_BOT_POD_IMAGE_PULL_SECRET=true
+      - BOT_CPU_REQUEST=700m
+      - BOT_MEMORY_REQUEST=1500Mi
+      - BOT_MEMORY_LIMIT=2Gi
     command: python manage.py runserver 0.0.0.0:8000
-    entrypoint: []
+    entrypoint: ["/docker-entrypoint-k8s.sh"]
     deploy:
       resources:
         limits:
@@ -88,6 +117,8 @@ services:
 
   postgres:
     image: postgres:15.3-alpine
+    ports:
+      - "5432:5432"
     environment:
       POSTGRES_DB: attendee_development
       POSTGRES_USER: attendee_development_user
@@ -106,6 +137,8 @@ services:
 
   redis:
     image: redis:7-alpine
+    ports:
+      - "6379:6379"
     networks:
       - attendee_network
     restart: unless-stopped
