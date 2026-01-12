@@ -107,6 +107,7 @@ environment:
   - BOT_CPU_REQUEST=700m
   - BOT_MEMORY_REQUEST=1500Mi
   - BOT_MEMORY_LIMIT=2Gi
+  - BOT_EPHEMERAL_STORAGE_REQUEST=3Gi
 ```
 
 ### Networking
@@ -204,9 +205,11 @@ For production deployments:
    - Use network policies to restrict traffic
 
 4. **Scaling:**
-   - Use Karpenter or Cluster Autoscaler for node scaling
-   - Configure HPA (Horizontal Pod Autoscaler) if needed
-   - Monitor costs with node right-sizing
+   - ✅ Cluster Autoscaler is deployed and configured (scales 1-10 nodes)
+   - Node capacity: 2 bots per t3.large node (limited by CPU: 1930m / 700m)
+   - Resource requests: 700m CPU, 1500Mi memory, 3Gi ephemeral-storage per bot
+   - Scale-up time: ~2 minutes, Scale-down time: ~10 minutes idle threshold
+   - Monitor costs with CloudWatch metrics on node count
 
 ## Resources
 
