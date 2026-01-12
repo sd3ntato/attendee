@@ -24,6 +24,7 @@ services:
       - BOT_CPU_REQUEST=700m
       - BOT_MEMORY_REQUEST=1500Mi
       - BOT_MEMORY_LIMIT=2Gi
+      - BOT_EPHEMERAL_STORAGE_REQUEST=3Gi
     command: "celery -A attendee worker -l INFO --max-tasks-per-child=2"
     entrypoint: ["/docker-entrypoint-k8s.sh"]
     deploy:
@@ -81,6 +82,7 @@ services:
       - BOT_CPU_REQUEST=700m
       - BOT_MEMORY_REQUEST=1500Mi
       - BOT_MEMORY_LIMIT=2Gi
+      - BOT_EPHEMERAL_STORAGE_REQUEST=3Gi
     command: python manage.py runserver 0.0.0.0:8000
     entrypoint: ["/docker-entrypoint-k8s.sh"]
     deploy:
