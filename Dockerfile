@@ -88,13 +88,6 @@ RUN apt-get update && apt-get install -y xmlsec1
 # Install xclip
 RUN apt-get update && apt-get install -y xclip
 
-# Install aws-cli v2 (used by docker-entrypoint-k8s.sh to fetch EKS tokens)
-RUN apt-get update && apt-get install -y unzip && \
-    curl -sSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip && \
-    unzip -q /tmp/awscliv2.zip -d /tmp && \
-    /tmp/aws/install && \
-    rm -rf /tmp/aws /tmp/awscliv2.zip
-
 # Install python dependencies
 RUN pip install pyjwt cython gdown python-dotenv
 
