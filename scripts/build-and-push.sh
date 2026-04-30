@@ -15,7 +15,7 @@ AWS_PROFILE="$1"
 IMAGE_TAG="${2:-latest}"
 AWS_REGION="eu-north-1"
 AWS_ACCOUNT_ID=$(aws sts get-caller-identity --profile "${AWS_PROFILE}" --query Account --output text)
-ECR_REPOSITORY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/attendee"
+ECR_REPOSITORY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/meeting-assistant/attendee"
 
 echo "============================================"
 echo "Building attendee image with profile: ${AWS_PROFILE}"
